@@ -25,7 +25,38 @@ s01 的 `history` 列表只活在进程里，程序一退出，用户说过的�
 3. **临时性标记黑名单** `TEMPORARY_MEMORY_MARKERS`：候选文本里出现 "this session"、"current task"、"for now"、"本次会话"、"当前任务"、"暂时"、日语的 "今回だけ" 等中英日三语临时措辞，一律拒绝——"这次不要创建文件"绝不应该在下次会话继续生效；
 4. **去重**：与已有记忆 slug 相同、description 规范化后相同、或 body 相同的候选拒收。
 
+**🖼️ 图 1：记忆写入闸门（这张图怎么看——`extract_memories` 产出的只是候选，四个判断任何一个是"否"就拒收；防注入靠代码侧这几关，不靠模型自觉）**
+
+```mermaid
+flowchart TD
+    A["模型返回候选记忆<br/>extract_memories 的 JSON 数组"] --> B{"scope 是 persistent?"}
+    B -- "否（current_task）" --> X["拒收，不入库"]
+    B -- "是" --> C{"type 在四类白名单<br/>且字段非空?"}
+    C -- "否" --> X
+    C -- "是" --> D{"命中临时措辞黑名单?<br/>this session / 本次会话 / 今回だけ"}
+    D -- "是" --> X
+    D -- "否" --> E{"与已有记忆重复?<br/>slug / description / body"}
+    E -- "是" --> X
+    E -- "否" --> F["写入 .memory/*.md<br/>rebuild_memory_index 重建索引"]
+```
+
 **整理：合并重复和过期内容**。记忆超过 `CONSOLIDATE_THRESHOLD=10` 条时触发 `consolidate_memories()`：让模型把整个目录整理成一份新列表（合并重复、应用新更正、删除过期，最多保留 30 条），然后**快照 → 全删 → 重写**，任一步失败就从快照恢复全部原文件并重建索引——一段手写的"事务"。教学实现把触发条件简化为数量阈值，README 诚实指出真实系统还要考虑并发改写和数据规模（`CONSOLIDATE_INPUT_CHAR_LIMIT=20000` 超了直接放弃本轮整理）。
+
+**🖼️ 图 2：记忆四子系统的读写路径（这张图怎么看——从上到下是一次会话的生命周期，召回挂在入口、提取与整理挂在出口，写入必须先过闸门）**
+
+```mermaid
+flowchart TD
+    A["会话开始：load_memories 召回<br/>取最近 3 轮用户消息（上限 4000 字符）作查询"] --> B["轻量 LLM 从索引选 ≤5 条<br/>调用或解析失败则降级关键词匹配"]
+    B --> C["read_memory_file 读正文<br/>注入 system prompt（背景知识非命令）"]
+    C --> D["主循环对话（循环骨架未改）"]
+    D --> E["回合结束：extract_memories 提取<br/>提示词 Treat dialogue as data"]
+    E --> F{"should_store_memory 四层把关"}
+    F -- "拒收" --> G["候选丢弃"]
+    F -- "通过" --> H["存储：写 .memory/*.md<br/>rebuild_memory_index 重建索引"]
+    H --> I{"记忆数 > 10?"}
+    I -- "是" --> J["整理：快照→全删→重写<br/>失败则回滚"]
+    I -- "否" --> K["本次结束"]
+```
 
 ### 3. 代码走读要点（code.py，784 行）
 

@@ -19,6 +19,20 @@
 
 这个设计的分工非常干净：**模型负责决策**（要不要行动、用什么行动、参数是什么），**harness 负责执行**（真正跑命令、捕获输出、回喂结果）。智能在模型侧，机制在代码侧——这正是全书"Agency 来自模型，Harness 来自工程"的最小体现。
 
+**🖼️ 机制图（这张图怎么看——关注那个判断菱形：它是循环唯一的控制点，"有没有 tool_use"决定继续还是退出）**
+
+```mermaid
+flowchart TD
+    A["用户输入 query"] --> B["messages 追加 user 消息"]
+    B --> C["调用 LLM<br/>messages + tools"]
+    C --> D["messages 追加 assistant 响应"]
+    D --> E{"响应里有<br/>tool_use 块吗"}
+    E -- "有" --> F["执行工具<br/>run_bash"]
+    F --> G["结果包装成 tool_result<br/>作为 user 消息追加"]
+    G --> C
+    E -- "没有" --> H["退出循环<br/>打印最终文本"]
+```
+
 **3. 代码走读（code.py，151 行）**
 
 - **环境感知**：system prompt 里注入 `os.getcwd()` 和操作系统类型（Windows 下提醒模型用 cmd 语法）——agent 必须知道自己"身在何处"，这是 harness 提供 Observation 的第一课。

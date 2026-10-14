@@ -18,6 +18,22 @@ s02 以来所有工具都直接写在 `code.py` 里：工具定义是 Python 字
 
 课程里的 `docs` 和 `deploy` 是**进程内模拟 server**（`MOCK_SERVERS` 字典里的工厂函数）——真实的 MCP transport（stdio/SSE/HTTP、JSON-RPC 帧）不在本章实现，本章演示的是**协议边界**：发现与调用这两个动作长什么样、接入后 Harness 侧要处理什么。
 
+**🖼️ 图 1：从 connect_mcp 到外部工具调用的全链路（这张图怎么看——注意时间轴上的"下一轮"：connect 只写入 Harness 状态，工具真正出现在模型输入里要等下一轮组装，尾部的授权查询发生在 Model 调用工具时）**
+
+```mermaid
+flowchart TD
+    A["模型调用 connect_mcp(name)"] --> B["MCPClient<br/>tools/list 拿工具定义与调用入口"]
+    B --> C["Harness 保存 client<br/>system prompt 追加 Connected MCP servers"]
+    C --> D["下一轮开头 assemble_tool_pool()<br/>connect_mcp 生效于下一轮"]
+    D --> E["前缀命名 mcp__{server}__{tool}<br/>normalize 冲突检测 + 64 字符上限"]
+    E --> F["工具定义 + handlers + 策略表<br/>由同一次组装产出"]
+    F --> G{"模型调用 mcp__ 工具"}
+    G --> H["permission_hook 查 MCP_HOST_POLICY"]
+    H -- "allow" --> I["client.call_tool 用 server 原始工具名<br/>异常文本化为 MCP error"]
+    H -- "未配置则默认 confirm" --> J["终端弹出 Allow? y/N 询问"]
+    J -- "y" --> I
+```
+
 ### 3. 关键机制逐条走读（code.py，549 行）
 
 **① 循环不变，工具池变活**（`agent_loop`，第 486-496 行）：s01 的循环骨架照旧，唯一变化是每轮开头 `tools, handlers = assemble_tool_pool()`。于是有了本章最优雅的性质：**`connect_mcp` 生效于下一轮**——模型第 N 轮调用 connect，Harness 保存 client，第 N+1 轮组装时新工具自动出现在模型输入里。不需要重启、不需要重注册循环，工具集随会话生长。这正是 s02 dispatch map 的运行时化：s02 加工具要改代码，本章加工具是**数据**。
@@ -34,6 +50,20 @@ handlers[prefixed] = (
 ```
 
 模型看到带前缀的名字，handler 内部仍用 server 的原始工具名调 `call_tool`。**默认参数 `client=server, tool=raw_name` 是必须的**——否则循环里所有 lambda 闭包共享变量，全部指向最后一个 server 的最后一个工具。这是教学代码里藏的真实工程陷阱。
+
+**🖼️ 图 2：工具名的规范化与 handler 注册（这张图怎么看——三道校验串成一条漏斗：非法字符先被 normalize，长度和重名各自拦截，最后才允许把 handler 挂进工具池）**
+
+```mermaid
+flowchart TD
+    A["server 侧工具原名<br/>如 get.version"] --> B["normalize_mcp_name<br/>模型不允许的字符替换为下划线"]
+    B --> C["拼前缀成 mcp__docs__get_version"]
+    C --> D{"长度超过 64 字符？"}
+    D -- "是" --> E["直接报错<br/>模型 API 硬约束"]
+    D -- "否" --> F{"与已注册工具规范化后重名？"}
+    F -- "是" --> G["报错<br/>不许悄悄映射成同名"]
+    F -- "否" --> H["注册 handler<br/>lambda 默认参数绑定 client=server, tool=raw_name"]
+    H --> I["call_tool 内部仍用 server 原始工具名"]
+```
 
 **④ 权限：授权来自宿主，不来自 server**（第 204-210、421-427 行）：MCP server 可以在工具定义里自报 `readOnlyHint`/`destructiveHint`（mock server 就报了），但这些**只是 server 的自称**，不能作为授权依据。本章用宿主侧策略表 `MCP_HOST_POLICY`（`(server, tool) → allow/confirm`），`permission_hook` 对 `mcp__` 前缀工具查表：**未配置的外部工具默认要求用户确认**——即使 description 写着 readOnly 也不放行。fail closed，与 s03 一脉相承，并且与 MCP 官方规范的安全条款逐字呼应（见拓展资料 1）。
 

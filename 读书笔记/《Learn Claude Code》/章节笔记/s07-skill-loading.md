@@ -19,6 +19,18 @@
 
 关键洞察：**"知道有这个技能"和"知道怎么执行这个技能"是两种粒度的知识，成本结构完全不同**。目录让模型具备"何时需要"的判断力，全文让模型具备"如何执行"的规程——前者必须常备，后者理应现用现取。这就是 Anthropic 官方所说的 progressive disclosure（渐进式披露）的最小实现。
 
+**🖼️ 图 1：渐进式披露的两级加载流程（这张图怎么看——上一级是每轮都发送的目录，只有"适用"那条分支才会把 SKILL.md 全文拉进上下文）**
+
+```mermaid
+flowchart TD
+    A["启动 scan()<br/>glob skills/*/SKILL.md 并建注册表"] --> B["catalog 拼进 system prompt：每技能 name + description<br/>几十 token，每轮请求都发送（常驻成本）"]
+    B --> C{"模型判断这条技能适用于当前任务吗"}
+    C -- "否" --> D["不加载：零上下文成本"]
+    C -- "是" --> E["tool_use: load_skill(name)"]
+    E --> F["load(name) 查注册表返回 SKILL.md 全文<br/>作为 tool_result 进入消息历史"]
+    F --> G["按需加载，但用完不卸载<br/>膨胀压力转移给 s08 压缩"]
+```
+
 ### 3. 代码走读（code.py，399 行）
 
 - **`SkillLoader.scan()`**（89–113 行）：启动时 glob `skills/*/SKILL.md`，逐文件解析。几个防御性细节值得注意：① `manifest.resolve().is_relative_to(skills_root)`——拒绝符号链接逃逸出 skills 目录的文件；② frontmatter 解析失败、不是 dict、缺字段都有兜底——`name` 缺省回退到目录名，`description` 缺省回退到正文第一行（还顺手剥掉 `#` 标题前缀、压缩空白）。**技能写得再烂，目录也不会崩**。
@@ -27,6 +39,19 @@
 - **`load(name)`**（123–128 行）：查启动时建立的注册表返回全文。**`name` 只是字典键，绝不拼成文件路径**——模型无法通过构造名字（如 `../../etc/passwd`）读到 skills 目录之外的文件，注入面在 harness 侧被结构性地封死。叫错名字时返回 `Error: Unknown skill 'X'. Available: ...`——又一次"错误返回值里教模型下一步"。
 - **`load_skill` 的注册**（209–231 行）：就是 TOOLS 数组里加一条 schema + `TOOL_HANDLERS` 里加一行 `"load_skill": SKILL_LOADER.load`。**从循环的视角看，加载一份规范和读一个文件是同构的**——知识加载被统一进了 s02 的工具分发框架，零新机制。
 - **一个隐藏成本**：加载后的 `SKILL.md` 全文作为 `tool_result` 追加进消息列表，**之后每一轮都在上下文里**。技能是"按需加载"，但不是"用完即弃"——这直接通向 s08 的压缩问题（作者也在"接下来"里点破）。
+
+**🖼️ 图 2：技能加载路径上的两道防御（这张图怎么看——左边两个菱形是 scan 阶段的"坏技能降级"，最下面一行是 load 阶段"只查表不拼路径"的结构性封死）**
+
+```mermaid
+flowchart TD
+    A["scan() 逐个解析 SKILL.md"] --> B{"resolve() 后仍在 skills 目录内？"}
+    B -- "否（符号链接逃逸）" --> C["拒绝该文件"]
+    B -- "是" --> D{"frontmatter 能解析且字段齐全？"}
+    D -- "否" --> E["兜底降级：name 用目录名<br/>description 用正文首行（剥 # 前缀）"]
+    D -- "是" --> F["登记进启动时建的注册表"]
+    E --> F
+    F --> G["load(name) 只做字典查表，绝不拼文件路径<br/>未知名字返回 Error + Available 列表"]
+```
 
 ### 4. 实战观察（沙盒实测）
 

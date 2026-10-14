@@ -22,6 +22,22 @@ s01–s14 每章一个机制，各自跑在独立的示例里：权限在 s03 �
 
 循环的判定结构跟 s01 一模一样：`has_tool_use(response.content)` 决定是否继续。所有机制都不改写循环本体，而是占据循环周围的**十二个注入点**（README 第 61–74 行的表格）：用户输入前后、LLM 前（cron 队列、后台通知、压缩、prompt 组装）、LLM 调用（错误恢复）、工具执行前（权限 hooks）、分发（工具池组装）、执行时（后台分流）、执行后（PostToolUse）、返回循环（tool_result）、停止时（Stop hooks）。这就是 s01 那句"机制长在循环上"的最终形态。
 
+**🖼️ 图 1：集成总图——机制全部挂在循环边缘（这张图怎么看——事件从四类源进入同一个 while，判定菱形仍是 s01 的 has_tool_use；其余每个节点都是某个机制的注入点，循环骨架一行未改）**
+
+```mermaid
+flowchart TD
+    S["事件源：用户输入 / cron 到期 / 后台完成 / Lead 收件箱"] --> A["一轮开始：cron 与后台通知注入 messages"]
+    A --> B["压缩管线 + 重建 system prompt<br/>memory / skills / MCP + 每轮重组工具池"]
+    B --> C["调 LLM（外包错误恢复：429 / 529 / 截断 / 超长）"]
+    C --> D{"响应里有 tool_use 吗"}
+    D -- "否：Stop hooks" --> E["记忆提取 / goal 判断后返回"]
+    D -- "是" --> F["PreToolUse hooks + 权限闸门<br/>（异步轮次禁弹交互确认）"]
+    F --> G["分发：内置工具 / MCP / 后台分流"]
+    G --> H["PostToolUse hooks"]
+    H --> I["tool_result 回 messages"]
+    I --> A
+```
+
 ### 3. 代码走读（code.py，3326 行——全书最重的一章）
 
 **复用而不是重写**：`load_memory_runtime()`（L84–102）用 `importlib` 直接加载 s09 的 code.py 作为模块，把本章的 `client`、`MODEL`、`WORKDIR` 注入进去共享——记忆系统是"同一个运行时"，不是复制粘贴的第二份。
@@ -43,6 +59,22 @@ s01–s14 每章一个机制，各自跑在独立的示例里：权限在 s03 �
 **后台与 cron**（L2279–2613）：`run_in_background=true` 的 bash 进 daemon 线程，主循环立即拿到占位 tool_result，真实结果以 `<task_notification>` 注入下一轮。cron 是独立 daemon 线程每秒扫一次；durable 任务落盘 `.scheduled_tasks.json`；一次性任务先置 `pending_delivery` 再入队，**模型调用成功才 acknowledge，失败放回队列**——交付语义是"至少一次"（L2568–2590 的 `acknowledge_cron_jobs`/`restore_cron_jobs`）。Shell 进程跑在独立进程组，宿主退出/SIGTERM 时 `_stop_all_shell_processes` 收尸。
 
 **主循环组装**（L3137–3260）：`agent_loop` 每轮开头消费 cron 队列注入 `[Scheduled]` 消息 → 注入后台通知 → 每 3 轮没写 todo 就插 `<reminder>` → 跑压缩管线 → 重建 system prompt → **每轮重新 `assemble_tool_pool()`**（所以 `connect_mcp` 之后下一轮就能用 `mcp__docs__search`）→ 带恢复地调 LLM → 逐 tool_use 过 hooks/权限/后台分流/分发 → 结果回喂。`async_event_loop`（L3271–3298）在后台线程每秒检查 cron 队列、Lead 收件箱、已完成后台任务，任一事件自动唤醒一轮 agent——**事件源从"用户输入"扩展到了四类**。
+
+**🖼️ 图 2：四类事件源汇聚同一份 messages（这张图怎么看——纵向是时间，用户输入、cron、后台、队友四路事件都注入同一份 messages 并唤醒同一轮 agent，这正是 12-Factor 说的 unify execution state）**
+
+```mermaid
+sequenceDiagram
+    participant U as 用户输入（stdin）
+    participant C as cron 线程
+    participant B as 后台任务线程
+    participant T as 队友 / Lead 收件箱
+    participant L as agent_loop 与 messages
+    U->>L: UserPromptSubmit hooks
+    C->>L: 到期任务以 Scheduled 消息注入
+    B->>L: 结果以 task_notification 注入
+    T->>L: 队友 result / plan 审批
+    Note over L: async_event_loop 每秒轮询，任一事件自动唤醒一轮
+```
 
 ### 4. 实战观察（沙盒实测，两次运行）
 

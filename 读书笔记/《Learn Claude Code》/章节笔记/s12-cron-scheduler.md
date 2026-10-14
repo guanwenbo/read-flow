@@ -21,6 +21,22 @@ s11 的后台任务解决的是"命令开始**之后**"的事：耗时命令挪�
 
 模型侧只看到三个新工具：`schedule_cron` / `list_crons` / `cancel_cron`。值得注意的是**调度能力本身是作为工具暴露给模型的**——不是用户命令，是模型在理解"每天早上 9 点"这类自然语言后自己算出 cron 表达式并注册。本章保留 s04 的五个基础工具和 Hooks，但**故意不带入 s11 的后台命令**：因为定时任务传递的是一条待执行的 prompt，而不是某个后台命令的执行结果，两个机制正交。
 
+**🖼️ 图 1：定时任务的四组件与交付链路（这张图怎么看——跟着箭头往下走，注意"到期"与"交付"是两个被队列解耦的独立等待：调度线程一秒都不停，队列线程只等 Agent 空闲）**
+
+```mermaid
+flowchart TD
+    R["scheduled_jobs 注册表<br/>CronJob + .scheduled_tasks.json"] --> A["调度线程 cron_scheduler_loop<br/>每秒读本地时间匹配五段式 cron"]
+    A --> B{"到期且 last_fired<br/>不是本分钟？"}
+    B -- "是" --> C["置 pending_delivery=True<br/>写盘成功才继续"]
+    C --> D["入内存队列 cron_queue"]
+    B -- "否" --> A
+    D --> E{"队列线程抢到 agent_lock？<br/>acquire(blocking=False)"}
+    E -- "没抢到：用户正对话" --> F["等 0.2 秒后重试"]
+    F --> E
+    E -- "抢到：Agent 空闲" --> G["agent_loop 入口 consume_cron_queue()<br/>注入 Scheduled 前缀的 prompt"]
+    G --> H["模型首次响应成功<br/>acknowledge_cron_jobs()"]
+```
+
 ### 3. 关键机制逐条走读（code.py，790 行）
 
 **CronJob 保存什么**（第 269-277 行）：`id / cron / prompt / recurring / durable / pending_delivery / last_fired`。后两个字段是整个交付状态机的核心：`pending_delivery` 表示"已到期但模型还没收到"，`last_fired` 是分钟级标记（`%Y-%m-%d %H:%M`），防止同一分钟内每秒轮询都重复入队。
@@ -32,6 +48,23 @@ s11 的后台任务解决的是"命令开始**之后**"的事：耗时命令挪�
 **Agent 空闲后才交付**（`queue_processor_loop`，第 727-735 行）：队列线程用 `agent_lock.acquire(blocking=False)` 非阻塞抢锁——用户正在对话时抢不到，就等下一轮 0.2 秒的轮询。这避免了定时回合和用户回合**同时修改同一个 messages 数组**。交付发生在 `agent_loop` 开头（第 650-654 行）：`consume_cron_queue()` 取出任务，每个包装成 `[Scheduled] {prompt}` 的 user 消息追加进会话。
 
 **确认与失败回退**（第 656-679 行）：模型**首次响应成功**后才 `acknowledge_cron_jobs()`——recurring 任务清掉 `pending_delivery` 等待下次匹配，one-shot 任务直接删除。如果 API 调用抛异常，刚追加的 `[Scheduled]` 消息会从 messages 里删掉，任务通过 `restore_cron_jobs()` 重新放回队列、重新置 pending。这就是 README 明说的 **at-least-once 交付**：进程若在"模型已接收 prompt"和"确认状态写盘"之间崩溃，重启后同一任务会再交付一次。
+
+**🖼️ 图 2：at-least-once 交付状态机（这张图怎么看——沿着状态迁移找"回边"：ack 失败或 API 抛异常会把任务送回待交付，正是这条回边让重复交付成为可能）**
+
+```mermaid
+stateDiagram-v2
+    [*] --> REG: schedule_cron 注册进注册表
+    REG: 待匹配 pending_delivery=False
+    REG --> DUE: cron 匹配且 last_fired 不是本分钟
+    DUE --> Q: 置 pending_delivery=True 且写盘成功
+    Q: 在 cron_queue 中等待 Agent 空闲
+    Q --> DLV: 队列线程抢到 agent_lock
+    DLV: 已注入 Scheduled 消息，等模型首次响应
+    DLV --> REG: recurring 任务 ack 后清 pending_delivery
+    DLV --> [*]: one-shot 任务 ack 后直接删除
+    DLV --> Q: 响应抛异常则删消息并 restore 重入队
+    note right of DLV: 崩溃窗口内重启会重复交付一次
+```
 
 **持久化的两个工程细节**：① `save_durable_jobs()` 用临时文件 + `os.replace()` 原子替换，文件名带 pid 和线程 id 防冲突；② `load_durable_jobs()` 加载时逐条校验（cron 合法性、id 前缀、prompt 非空），坏条目打印警告跳过，文件损坏则报错而不是静默忽略。
 

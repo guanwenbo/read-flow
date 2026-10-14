@@ -18,6 +18,24 @@ s05 保留 s04 的全部机制（工具分发、权限、hooks），加入 `todo
 2. **todo_write 工具**：走 s02 的 dispatch map 注册，工具定义与其他工具并列；
 3. **reminder 计数器**：连续 3 个工具调用轮次没用 `todo_write`，harness 就往第三轮的结果里追加一条 `<reminder>Update your todos.</reminder>`，随后计数清零。
 
+**🖼️ 图 1：todo 外化为上下文 artifact 的闭环（这张图怎么看——注意右侧那条回到模型的闭环：计划不在模型脑子里，而是每轮作为最新 tool_result 重新投递到上下文尾部，reminder 只是这条闭环的兜底保险丝）**
+
+```mermaid
+flowchart TD
+    A["模型：todo_write(list)"] --> B["TodoManager.update()<br/>json.loads / ast.literal_eval 解析后校验"]
+    B -- "通过" --> C["内存任务列表 = source of truth<br/>最多 20 项；同时只允许 1 个 in_progress"]
+    C --> D["render()<br/>[ ] / [>] / [x] + (N/M completed)"]
+    D --> E["tool_result 回喂模型<br/>落在上下文尾部（注意力最强区）"]
+    E --> F["模型每轮重读计划<br/>对抗目标漂移"]
+    F --> A
+    B -- "抛出 ValueError" --> G["Error: ... 文本回喂<br/>模型自行改方案重试"]
+    G --> A
+    E --> H{"连续 3 轮未调用 todo_write？"}
+    H -- "是" --> I["结果里混入 text 块<br/>reminder: Update your todos."]
+    H -- "否" --> F
+    I --> F
+```
+
 ### 3. 代码走读（code.py，368 行）
 
 - **TodoManager.update()——校验是真正的主角**。接受 list 或字符串；字符串先 `json.loads`、失败再 `ast.literal_eval`（**明确不用 `eval`**，模型生成的字符串直接 eval 是远程代码执行的邀请函）。校验规则：最多 20 项；每项必须有非空 `content`；`status` 必须是 `pending/in_progress/completed` 三态之一；**同一时间只能有一个 `in_progress`**——这条约束最妙，它用数据结构强制"串行专注"，把"一次只做一件事"从 prompt 建议变成了硬约束。所有校验失败抛 ValueError，到 `run_todo_write` 被转成 `"Error: ..."` 文本回喂——s02 的错误文本化哲学第三次出现，模型读到 "Only one todo can be in_progress at a time" 会自己改方案重试。
@@ -32,6 +50,23 @@ s05 保留 s04 的全部机制（工具分发、权限、hooks），加入 `todo
   ```
   ① 按**轮**（LLM turn）计数，不是按工具调用计数——一轮里并行 3 个 write_file 也只 +1；② reminder 是作为 `text` 块**混在 tool_result 数组里**回喂的，终端上不可见，只有模型看得到；③ 触发后立刻清零。这是 harness 主动向上下文注入"软提醒"的第一个例子——不拦截、不改行为，只是提高"该更新计划了"在下一轮注意力里的权重。
 - **一个细节**：`rounds_since_todo` 定义在 `agent_loop` 函数开头，所以**每个用户回合重新计数**——reminder 约束的是单次任务内的计划维护，不跨任务。
+
+**🖼️ 图 2：todo 三态与校验约束（这张图怎么看——状态流转本身只有三态，重量全在注释：校验规则把"一次只做一件事"从 prompt 建议变成了数据结构级的硬约束）**
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> in_progress : 开始做
+    in_progress --> completed : 完成
+    in_progress --> pending : 回退
+    completed --> [*]
+    note right of in_progress
+        同一时刻只允许一个 in_progress
+        最多 20 项，每项 content 必须非空
+        status 只能是三态之一，否则抛 ValueError
+        校验失败由 run_todo_write 转成 Error 文本回喂
+    end note
+```
 
 ### 4. 实战观察（沙盒实测，/tmp/lcc-s05）
 

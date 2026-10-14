@@ -20,12 +20,32 @@ s05 的 TodoWrite 解决的是"提醒自己还有什么没做"：一张清单，
 
 **两阶段建图**——本章最精妙的设计细节，README 专门解释：任务图分两步构建，**先创建所有节点拿到运行时 ID，再用 `update_task` 添加依赖边**。为什么必须这样？因为模型可能在一条响应里并行发出多个 `create_task` 调用，而这些同级调用在任何工具结果返回前就已全部确定——此时任何 ID 都还不存在，第二个调用无法引用第一个调用生成的 ID。system prompt 里专门写了一句教模型遵守这个协议："Create all task nodes first. After create_task returns runtime-generated IDs, use update_task with those exact IDs to add dependencies." 这是"工具的局限性要用提示词补偿"的典型案例。
 
+**🖼️ 图 1：任务依赖 DAG（这张图怎么看——箭头从"前置任务"指向被它挡住的下游：schema 一完成，endpoints 与 docs 同时解锁、可并行认领，tests 仍被 endpoints 挡着）**
+
+```mermaid
+flowchart LR
+    S["Create DB schema<br/>blockedBy: 无（首个可认领）"] -->|"解锁"| E["Write API endpoints<br/>blockedBy: schema"]
+    S -->|"解锁"| D["Write docs<br/>blockedBy: schema"]
+    E -->|"解锁"| T["Write tests<br/>blockedBy: endpoints"]
+```
+
 **依赖校验（update_dependencies）**：修改前先整体验证——目标任务必须存在、仍为 pending 且无人认领（认领后就锁死结构）；每个依赖必须存在、不能是自身；`_depends_on()` 用 DFS 做传递闭包检查**防止成环**（给 A 加依赖 B 之前，先确认 B 不（传递）依赖 A）。校验全部通过才一次性保存。重复添加已有依赖是幂等的。
 
 **认领与完成的状态机**：两个动作、三个状态：`pending ──claim──→ in_progress ──complete──→ completed`。
 
 - `claim_task`：只有 pending 且 `incomplete_dependencies()` 为空才能认领——注意依赖文件**不存在也算未完成**（`except (FileNotFoundError, ValueError)` 归入 incomplete），防止指向已删除任务的悬挂依赖被误认为满足。认领设置 owner 并落盘。
 - `complete_task`：只有 in_progress 且 **owner 匹配**才能完成（防越权提交）。完成后做一件贴心的事：先在完成前快照"已就绪集合" `ready_before`，落盘后再扫一遍，差集就是**刚刚被本任务解锁的下游任务**，把它们的 subject 附在返回值里告诉模型 "Unblocked: ..."——工具返回值直接驱动下一步行动（s02"返回值教模型下一步"哲学的延续）。
+
+**🖼️ 图 2：认领状态机（这张图怎么看——真身只有 3 个状态，"被阻塞"不是独立状态而是 pending 上的条件；每次迁移都有守卫，complete 时还顺手算出刚被解锁的下游）**
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending : create_task 生成并落盘
+    pending --> pending : 有未完成 blockedBy（阻塞，认领被拒）
+    pending --> in_progress : claim_task（依赖全空 + 记 owner）
+    in_progress --> completed : complete_task（owner 匹配）
+    completed --> [*] : ready_before 差集 → 解锁下游
+```
 
 **读取分层**：`list_tasks` 只给一行摘要（状态图标 `[ ]/[>]/[x]` + ID + subject + owner + blockedBy），`get_task` 才返回完整 JSON——跨会话恢复时先扫清单、再按需取详情，和 s09 记忆的"索引 + 正文"是同一个模式。
 

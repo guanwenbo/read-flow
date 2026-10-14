@@ -30,6 +30,40 @@ s01–s15 里，每一步都是模型看着当前的 `messages[]` 临场决定�
 
 `parallel` 和 `pipeline` 的区别是本章最容易被低估的设计：`pipeline` 里 item A 跑到第 3 阶段时 item B 可能还在第 1 阶段（代码 L518–527，每个 item 一个 `run_item` 协程，`asyncio.gather` 汇合）；只有"下一步必须同时用到上一步全部结果"时才该用 `parallel` 等齐。
 
+**🖼️ 图 1：Workflow 执行与 resume 流程（这张图怎么看——信任边界在第一个菱形：模型只能从宿主 registry 里选脚本；journal 的 sha256 命中即 cached，正是 resume 零成本的原因；parallel 与 pipeline 的屏障语义在此分叉）**
+
+```mermaid
+flowchart TD
+    A["模型一次 Workflow tool_use<br/>只给 name / args / resume_from_run_id"] --> B{"name 在宿主 WORKFLOWS registry 里吗"}
+    B -- "否" --> X["拒绝——模型不能提交可执行代码"]
+    B -- "是" --> C["校验 meta / args / snapshot<br/>加载 ExecutionState"]
+    C --> D["逐 agent() 查 journal：内容 sha256 命中 → 直接返回 cached"]
+    D --> E{"用哪种编排原语"}
+    E -- "parallel" --> F["等齐屏障：全部 item 跑完才继续"]
+    E -- "pipeline" --> G["item 之间无屏障：各自走完全部阶段"]
+    F --> H["护栏：AGENT_CAP / CONCURRENCY / Budget"]
+    G --> H
+    H --> I["journal 追加 + 快照落盘<br/>最终以 tool_result 回主循环"]
+```
+
+**🖼️ 图 2：parallel 等齐 vs pipeline 无屏障（这张图怎么看——只看一处差别：parallel 有等齐屏障、pipeline 没有；选错原语，四个维度就不是并行而是排队）**
+
+```mermaid
+sequenceDiagram
+    participant S as workflow 脚本
+    participant A as item A
+    participant B2 as item B
+    Note over S,B2: pipeline —— item 之间无屏障
+    S->>A: 阶段1
+    S->>B2: 阶段1
+    A->>A: 直接推进阶段2→3（不等 B）
+    B2->>B2: 仍停在阶段1，随后自行推进
+    Note over S,B2: parallel —— 等齐屏障
+    S->>A: 阶段1
+    S->>B2: 阶段1
+    Note over S,B2: 必须 A、B 全部完成，才一起进入阶段2
+```
+
 ### 3. 代码走读（code.py，888 行）
 
 **稳定调用键（resume 的灵魂）**：每个 `agent()` 调用算一个语义 key——`f"{kind}|{label}|{prompt}|{json.dumps(schema, sort_keys=True)}"` 的 sha256（L360–364）。两个细节：① 用 `hashlib.sha256` 而不是 Python 内置 `hash()`，因为后者每个进程加盐，跨进程 resume 就全错位了（L52–55 的注释专门点了这个坑）；② key 基于**调用内容**而不是"第几个完成"——`parallel`/`pipeline` 里完成顺序是不确定的，用序号当 key 两次运行就对不上。resume 时脚本**重新执行**，但 `agent()` 先查 journal 缓存，命中就直接返回缓存值（L471–482），只有改过的调用才真正运行。

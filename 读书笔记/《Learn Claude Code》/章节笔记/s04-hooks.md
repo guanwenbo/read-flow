@@ -19,6 +19,24 @@ s03 的循环和权限逻辑完全保留，唯一变动是把 `check_permission(
 | PostToolUse | 工具执行后 | 副作用（自动 git add）、输出检查 |
 | Stop | 循环即将退出时 | 收尾统计、决定是否继续循环 |
 
+**🖼️ 图 1：四个事件挂在循环的哪些位置（这张图怎么看——骨架仍是 s01 的循环，四个 hook 只贴在循环的四个边缘：输入前、行动前、行动后、结束前；前两个能改控制流方向，后两个只能看）**
+
+```mermaid
+flowchart TD
+    A["用户输入 query"] --> U["UserPromptSubmit hooks<br/>返回值不参与控制流"]
+    U --> B["调用 LLM"]
+    B --> C{"响应里有 tool_use 块吗"}
+    C -- "有" --> P["PreToolUse hooks<br/>permission_hook → log_hook"]
+    P -- "非 None：阻止本次执行" --> BL["返回的字符串作为 tool_result 回喂"]
+    P -- "None：放行" --> E["执行工具"]
+    E --> O["PostToolUse hooks<br/>large_output_hook，纯观察点"]
+    BL --> B
+    O --> B
+    C -- "没有" --> S["Stop hooks<br/>summary_hook"]
+    S -- "非 None：拒绝结束，注入 user 消息" --> B
+    S -- "None：允许退出" --> Z["退出循环"]
+```
+
 机制本身只有 20 行：
 
 ```python
@@ -35,6 +53,19 @@ def trigger_hooks(event, *args):
 ```
 
 **返回值协议是整个设计的枢纽**：hook 返回 `None` = "我只是看看"；返回非 None = "拦截/接管"。`PreToolUse` 返回字符串 → 本次工具执行被阻止（字符串作为 tool_result 回喂模型）；`Stop` 返回字符串 → 循环不退出，字符串作为 user 消息注入、继续循环。`UserPromptSubmit` 和 `PostToolUse` 的返回值不参与控制流（本章定位为纯观察点）。
+
+**🖼️ 图 2：trigger_hooks 的短路表决（这张图怎么看——顺着返回值分支走：只有 None 才会走到下一条回调，第一个非 None 立刻返回，注册在它后面的 hook 全部没机会跑）**
+
+```mermaid
+flowchart TD
+    A["trigger_hooks(event, *args)"] --> B["取注册表 HOOKS[event]<br/>按注册顺序遍历回调"]
+    B --> C{"还有下一条回调？"}
+    C -- "没有" --> D["返回 None<br/>全程只观察，无人拦截"]
+    C -- "有" --> E["result = callback(*args)"]
+    E --> F{"result is not None？"}
+    F -- "是：拦截 / 接管" --> G["立即 return result<br/>后续 hook 被短路跳过"]
+    F -- "否：观察" --> C
+```
 
 ### 3. 代码走读（code.py，280 行）
 

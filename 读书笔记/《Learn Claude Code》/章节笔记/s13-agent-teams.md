@@ -20,6 +20,30 @@ s06 的 subagent 解决了"一次性委派"，s10 的任务系统解决了"工�
 6. **可选 worktree**：任务可绑定独立 Git 工作目录，队友的文件/Shell 工具 cwd 由任务决定；
 7. **类型化协议**：关机握手和计划审批用带 `request_id` 的结构化消息，不接受自由文本猜测。
 
+**🖼️ 图 1：团队协作时序（这张图怎么看——纵向看时间：提案闸门在 spawn 之前，队友的产出先走 MessageBus 再"唤醒"Lead，最后以 request_id 握手关停，全程 Lead 收件箱之外还有一个共享任务板）**
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant L as Lead
+    participant T as 队友线程
+    participant B as MessageBus 收件箱
+    U->>L: 描述目标（重构后端）
+    L-->>U: 只提出分工方案，等确认
+    Note over L,U: 提案闸门是提示词契约，确认前不 spawn
+    U->>L: 确认
+    L->>L: create_task 建图，先 claim 初始任务
+    L->>T: spawn_teammate 启动独立 s01 循环线程
+    T->>T: WORK 态执行任务
+    T->>L: send_message 中间协作汇报
+    T->>B: 写 result 与 idle_notification 两个事件
+    Note over L,B: 运行时投递并唤醒新 Lead 回合（check_inbox 不是模型工具）
+    L->>L: 亲自 bash 复验队友产出
+    L->>T: request_shutdown 带 request_id
+    T->>L: shutdown_response
+    Note over L,T: 校验类型/方向/pending 三重通过后线程退出
+```
+
 ### 3. 关键机制逐条走读（code.py，1887 行，全书最重的一章）
 
 **① 团队提案闸门是提示词契约，不是代码闸门**（第 641-655 行）：Lead 的 system prompt 明确写着"先提出小团队方案并等用户确认，确认前不许调 spawn_teammate"。注意这里作者选择了**软约束**——启动队友改变成本、并发度和工作区的写入者集合，这个决策交给"提示词 + 用户确认"而不是硬编码拦截，与 s03 的权限哲学一致：边界由人定，代码只提供执行点。
@@ -35,6 +59,27 @@ s06 的 subagent 解决了"一次性委派"，s10 的任务系统解决了"工�
 **⑥ 工作目录由任务决定**（第 744-773 行）：队友的 bash/read/write/edit/glob 全部经过 `assignment_cwd()` 解析目录——绑定 worktree 的任务解析到 `.worktrees/<name>`，未绑定的回 WORKDIR，**没认领任务的队友直接用不了工作区工具**（返回 "Claim a Task first"）。worktree 的创建只允许 Lead 调 `create_worktree`（校验任务 pending 且未绑定 → 校验名称/分支/Git 注册 → `git worktree add` → 最后才写任务绑定，失败留现场报 partial operation）；**移除则连模型都不给**——`remove_worktree` 是宿主保留函数。README 特别警告：worktree 只是目录隔离，不是安全沙箱。
 
 **⑦ 类型化协议的三重校验**（`match_response`，第 944-967 行）：关机和计划审批不靠自由文本，走 `ProtocolState`（request_id / type / sender / target / status）。响应生效需要同时满足：类型匹配（shutdown 配 shutdown_response）、方向匹配（响应者必须是原 target）、状态是 pending（防重复生效）。计划闸门更狠——**拦在工具分发层**（`_run_teammate_tool`，第 1038-1057 行）：`plan_gates` 状态为 required/pending/rejected 时，`bash`/`write_file`/`edit_file` 直接返回 "Blocked: plan status is ..."。审批还绑定 `work_version`：队友认领/释放任务会推进版本号，使旧审批自动失效——防止"批准的是上一个任务的计划"这类错配。
+
+**🖼️ 图 2：单个队友的 WORK/IDLE 生命周期与两道闸门（这张图怎么看——把上图里"队友线程"这一个参与者放大：WORK→IDLE 的循环靠 `wait_for_work` 转，先看收件箱再看任务板，认领必须原子）**
+
+```mermaid
+flowchart TD
+    A["队友线程启动<br/>spawn 前已原子 claim 初始任务"] --> B["WORK：跑 s01 循环"]
+    B --> P{"计划闸门 plan_gates<br/>required / pending / rejected？"}
+    P -- "是" --> X["工具分发层拦截 bash/write_file/edit_file<br/>返回 Blocked: plan status is ..."]
+    X --> B
+    P -- "已批准且 work_version 一致" --> E["正常执行工具"]
+    E --> F["complete_task<br/>发 result 与 idle_notification"]
+    F --> G["IDLE：每 2 秒 wait_for_work"]
+    G --> H{"收件箱有消息？"}
+    H -- "有：关机 / 审批 / Lead 直派" --> I["先处理消息，优先级高于任务板"]
+    H -- "没有" --> J["scan_unclaimed_tasks<br/>pending + 无 owner + 依赖完成"]
+    J --> K["task_store_lock 内原子 claim_task<br/>线程锁 + fcntl 文件锁"]
+    K -- "抢到" --> B
+    K -- "快照已失效" --> G
+    I -- "新任务或审批结果" --> B
+    I -- "收到关机请求" --> Z["回 shutdown_response<br/>校验通过后线程退出"]
+```
 
 ### 4. 实战观察（沙盒实测）
 

@@ -20,6 +20,21 @@ s02 的循环完全保留，唯一变动是在工具执行前插入 `check_permi
 
 三道都没命中 → 直接执行，日常操作零打扰。这个"deny 优先、ask 次之、默认放行"的优先级设计，正是真实 Claude Code 权限模型（allow / ask / deny 三态规则）的教学简化版（见拓展资料 1）。
 
+**🖼️ 图 1：权限决策拓扑（这张图怎么看——自上而下走到第一个命中的闸门就结束：deny 永远最先判，ask 只在规则命中后才出现，两道都没命中才是默认放行）**
+
+```mermaid
+flowchart TD
+    A["工具调用 tool_use"] --> B{"闸门 1 · DENY_LIST<br/>纯字符串包含匹配"}
+    B -- "命中（rm -rf /、sudo、shutdown…）" --> X["直接拒绝<br/>不问用户"]
+    B -- "未命中" --> C{"闸门 2 · PERMISSION_RULES<br/>{tools, check, message} 三件套"}
+    C -- "命中（出工作区 / 破坏性命令）" --> D["闸门 3 · ask_user<br/>input('Allow? [y/N]')"]
+    C -- "未命中" --> E["默认放行"]
+    D -- "显式 y / yes" --> E
+    D -- "其它（含直接回车）" --> X
+    E --> F["执行工具<br/>真实结果作为 tool_result 回喂"]
+    X --> G["回喂 tool_result：Permission denied."]
+```
+
 ### 3. 代码走读（code.py，267 行）
 
 - **闸门 1（check_deny_list）**：`DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]`，纯字符串包含匹配。README 特别声明它"使用简单字符串匹配来说明权限闸门的位置，**不能视为完整的安全边界**"——这是诚实的教学定位（详见问题 1）。
@@ -45,6 +60,19 @@ s02 的循环完全保留，唯一变动是在工具执行前插入 `check_permi
 - **观察 1（重要）：拒绝 ≠ 终止，模型会把拒绝当错误来"绕过"**。第二次写工作区外答 `n` 后，模型没有停下来问用户，而是连续换了 4 种姿势重试同一目标：改用 bash `ls` 探查 → 拼 `&&` 的 rm → 换相对路径 → `rm -f` → 换绝对路径。**"Permission denied." 被模型理解为可重试的错误，而不是用户的最终意志**——这是 s02 错误自愈本能与安全语义的一次正面冲突。
 - **观察 2（健壮性缺口）**：审批走 `input()`，当 stdin 是管道且输入耗尽时抛 `EOFError`，**整个 agent loop 崩溃退出**（Traceback 实测复现）。管道/无人值守场景下闸门 3 反而成了单点故障。
 - **观察 3（规则的按工具名匹配有盲区）**：让它写 `/etc/lcc_test.txt`，模型没用 `write_file` 工具而选了 `bash sudo tee ...`——同语义的行为换个工具就换了一套规则（这次是撞进闸门 1 才被拦住）。
+
+**🖼️ 图 2：拒绝回喂后的重试闭环（这张图怎么看——注意 deny 不是抛异常而是变成一条普通 tool_result，模型读到它后沿既有的"错误即重试"本能绕回下一轮，权限拒绝因此被当成待克服的障碍）**
+
+```mermaid
+flowchart TD
+    M["模型发出 tool_use<br/>（如写工作区外的文件）"] --> P{"check_permission(block)<br/>在工具执行之前"}
+    P -- "True：默认放行 / 用户答 y" --> T["执行工具"]
+    P -- "False：deny 命中 / 用户答 n" --> R["results 追加 tool_result<br/>Permission denied."]
+    R --> C["模型读作普通错误<br/>换路径 / 换工具 / 拼命令重试"]
+    C --> M
+    T --> D["回喂真实执行结果"]
+    D --> M
+```
 
 ## 二、与前面章节的关系
 

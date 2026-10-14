@@ -21,6 +21,20 @@ s01 的 agent 只有一个 bash 工具。模型想的是"读这个文件"，却�
 
 循环本体（LLM 调用、tool_use 判断、结果回喂）**一行没改**，唯一变动是把 s01 硬编码的 `run_bash(block.input["command"])` 换成 `TOOL_HANDLERS[block.name](**block.input)`。
 
+**🖼️ 机制图（这张图怎么看——左半是"给模型看的能力清单"，右半是"给 harness 看的执行路由"，两者靠工具名这个字符串对齐）**
+
+```mermaid
+flowchart LR
+    M["LLM 看到 TOOLS 数组<br/>5 条 JSON Schema"] -- "tool_use: name + input" --> D["TOOL_HANDLERS 字典<br/>工具名 → 处理函数"]
+    D --> H1["run_bash"]
+    D --> H2["run_read / run_write"]
+    D --> H3["run_edit / run_glob"]
+    H1 --> R["tool_result 回喂模型"]
+    H2 --> R
+    H3 --> R
+    R --> M
+```
+
 ### 3. 代码走读（code.py，206 行）
 
 **分发机制**：

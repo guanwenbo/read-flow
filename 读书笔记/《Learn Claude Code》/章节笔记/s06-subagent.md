@@ -24,6 +24,18 @@ README 用一张边界表把设计决策钉死，每一条都值得展开：
 
 注意这个设计的精确性：**隔离的是消息，不是进程或文件系统**。子 agent 写的文件父 agent 立刻可见（反之亦然），这使得"子 agent 干活、父 agent 验证"成为自然的工作流。而"子 agent 没有 task 工具"这一行 `SUB_TOOLS = list(BASE_TOOLS)`，用零行额外代码就封死了递归委派——**能力边界的最佳实现方式往往是"不给"而不是"拦截"**。
 
+**🖼️ 图 1：父子 agent 的上下文隔离与机制共享（这张图怎么看——实线是"委派出去、只回结论"的消息通道，虚线是"消息之外全都共享"的世界）**
+
+```mermaid
+flowchart LR
+    P["父 agent_loop<br/>messages 持续累积"] -- "tool_use: task(prompt)" --> T["task 只是一条普通工具<br/>TOOL_HANDLERS 里一行路由"]
+    T --> S["子循环 run_subagent<br/>messages 从一条 user 消息全新开始<br/>system 换成 SUB_SYSTEM"]
+    S -- "只回最终文本<br/>extract_text 兜底 (no summary)" --> P
+    S -. "同一进程 / 同一 WORKDIR / 同一套 execute_tool 与 hooks" .-> U["共享的世界<br/>父 agent 立刻看到子 agent 写的文件"]
+    U -.-> P
+    S -. "SUB_TOOLS 里没有 task" .-> N["能力边界靠不给<br/>零额外代码封死递归委派"]
+```
+
 ### 3. 代码走读（code.py，383 行）
 
 - **`run_subagent(prompt)`**（276–313 行）：本章核心，但它的循环体和父循环**逐字同构**——`client.messages.create` → 过滤 tool_use → 没有 tool_use 就返回 → 有就执行并回喂。作者没有抽象出公共函数，而是把循环写了第二遍，这在教学上是刻意的：让你亲眼看到"子 agent 没有新机制，它就是同一个循环再跑一遍"。差异只有四处：`messages` 从 `[{"role": "user", "content": prompt}]` 全新开始；system 用 `SUB_SYSTEM`（多了一句 "Complete the given task, then return a concise final answer"——明确要求子 agent 收敛出结论）；工具表没有 `task`；多了 `range(30)` 的轮数上限（父循环是 `while True`，子循环有 30 轮保险丝，跑满返回 "Subagent stopped after 30 turns without a final answer"）。
@@ -31,6 +43,23 @@ README 用一张边界表把设计决策钉死，每一条都值得展开：
 - **可观测性**（277、298、304 行）：`[Subagent started]` / `[Subagent done]` 紫色标记 + 子 agent 每次工具调用打印 `[sub] 工具名: 输出前100字符`。没有这三行 print，子 agent 就是个黑盒；有了它，委派过程在终端里是透明的。
 - **返回值兜底**（299 行）：`extract_text(response.content) or "(no summary)"`——子 agent 最后一轮如果只输出 tool_use 之外的空文本，父 agent 至少拿到一个占位符，不会拿到 None。
 - **权限传导**：子 agent 的工具调用走同一个 `execute_tool` → 同一组 PreToolUse hooks → 同一个 `permission_hook`。子 agent 想跑危险命令一样会被拦下问 `[y/N]`——**安全策略不随委派稀释**，这是"harness 层共享"最实际的意义。
+
+**🖼️ 图 2：一次委派的完整时序（这张图怎么看——纵向是时间，注意父上下文只在最后一步多出一条结论，中间全部发生在另一段消息列表里）**
+
+```mermaid
+sequenceDiagram
+    participant P as 父 agent_loop
+    participant T as task 工具
+    participant S as 子循环 run_subagent
+    P->>T: tool_use(task, prompt 已自行打包好工作目录)
+    T->>S: 新建 messages + SUB_SYSTEM + SUB_TOOLS
+    Note over P,S: 文件系统共享——子 agent 写的文件父 agent 立刻可见
+    S->>S: 执行子工具，走同一个 execute_tool 与权限 hook
+    Note over S: [Subagent started] / [sub] 工具名 / [Subagent done]
+    S-->>T: 最终文本（range(30) 跑满则返回停止提示）
+    T-->>P: 作为 tool_result 进入父 messages
+    Note over P: 父历史只多一条结论，探索痕迹随子循环结束消失
+```
 
 ### 4. 本章故意缺了什么
 

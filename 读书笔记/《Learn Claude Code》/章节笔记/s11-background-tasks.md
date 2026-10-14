@@ -22,6 +22,42 @@
 
 **进程生命周期管理**是本章隐藏的硬功夫：`atexit` 注册 + `SIGTERM` handler 都会在退出时遍历 `_shell_processes` 集合，对每个进程组先发 SIGTERM、50ms 后补 SIGKILL（Windows 无进程组概念，降级为 `terminate()`/`kill()`）；`_run_bash_process` 的 `finally` 里正常结束后也会清进程组（防子进程泄漏）。README 诚实声明：这是生命周期清理，**不是沙箱**——主动 `setsid` 另立门户的进程仍能逃逸。
 
+**🖼️ 图 1：后台任务跨回合时序（这张图怎么看——纵向是时间，注意"占位结果立刻返回"和"真实结果下一回合才注入"两者分离）**
+
+```mermaid
+sequenceDiagram
+    participant L as 模型
+    participant A as agent_loop(主线程)
+    participant B as BackgroundManager(daemon线程)
+    participant C as 命令行进程
+    L->>A: bash(command, run_in_background=true)
+    A->>A: PreToolUse hooks（权限/日志，主线程先跑）
+    A->>B: start()
+    B->>C: Popen 执行命令
+    B-->>A: 立即返回 bg_0001
+    A-->>L: 占位 tool_result（will be collected on a later turn）
+    Note over A,L: 同一轮继续执行其他 tool_use，不被慢命令阻塞
+    C-->>B: 命令结束（exit code）
+    B->>B: 更新 status 并入 _ready 队列
+    Note over A,B: —— 回合边界 ——
+    A->>B: 下一回合开头 collect()
+    B-->>A: bg_0001 的真实输出
+    A-->>L: 以 task_notification 文本块注入
+    Note over L: 模型读到通知，报告后台任务结果
+```
+
+**🖼️ 图 2：工具执行的同步/后台分叉（这张图怎么看——权限与 hooks 在分叉点之前，两条路径共享同一套执行与格式化逻辑）**
+
+```mermaid
+flowchart TD
+    A["execute_tool（模型请求的工具）"] --> B["PreToolUse hooks<br/>权限闸门 / 日志（主线程）"]
+    B --> C{"should_run_background?"}
+    C -- "否（默认）" --> D["call_tool 同步执行<br/>等待返回"]
+    C -- "是（模型显式传参）" --> E["start_background_task<br/>daemon 线程 + 占位结果"]
+    D --> F["tool_result 回喂模型"]
+    E --> F
+```
+
 ### 3. 代码走读要点（code.py，542 行）
 
 - **循环骨架只加一行**：`while True:` 里第一句变成 `inject_background_results(messages)`，其余（发消息、查 tool_use、回喂结果）与 s04 内核逐行一致。分叉点在 `execute_tool` 内部：PreToolUse hooks 照常在主线程执行（权限检查不因后台化而跳过！），之后才按 `should_run_background` 分流到 `start_background_task` 或同步的 `call_tool`——s03 的权限、s04 的 hooks 与后台执行完全正交。
